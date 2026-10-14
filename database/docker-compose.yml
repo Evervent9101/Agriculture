@@ -1,0 +1,24 @@
+# PostgreSQL for the farm app. Runs on the DEPLOYMENT server.
+# scripts/setup-database.sh copies this to /opt/devops-app/database/ and creates the .env next to it
+# (POSTGRES_PASSWORD and DB_PORT). The database only listens on 127.0.0.1, never on the network.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: farm-postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - POSTGRES_USER=farm
+      - POSTGRES_DB=farmdb
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - farm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U farm -d farmdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  farm_pgdata:
