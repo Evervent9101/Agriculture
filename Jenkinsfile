@@ -86,8 +86,10 @@ pipeline {
             steps {
                 sh '''
                     for i in 1 2 3 4 5 6; do
-                      if curl -fsS http://${DEPLOY_HOST}/api/health; then exit 0; fi
-                      echo "not healthy yet, retry $i"; sleep 5
+                      out=$(curl -fsS http://${DEPLOY_HOST}/api/health || true)
+                      echo "$out"
+                      if echo "$out" | grep -q '"db":"up"'; then exit 0; fi
+                      echo "not healthy yet (the API must report the database as up), retry $i"; sleep 5
                     done
                     echo "Smoke test failed" && exit 1
                 '''

@@ -1,13 +1,16 @@
-// PM2 process definitions. Run from the "current" release directory:
-//   pm2 startOrReload ecosystem.config.js --update-env
-// deploy.sh loads /opt/devops-app/.env first, so DATABASE_URL is available here.
+// PM2 process definitions.
+// deploy.sh sets APP_DIR=/opt/devops-app/current (a link to the newest release) and loads
+// /opt/devops-app/.env first, so DATABASE_URL is available here.
 const path = require('path');
+
+// Use the "current" link when deploy.sh provides it. Falling back to __dirname is for running by hand.
+const root = process.env.APP_DIR || __dirname;
 
 module.exports = {
   apps: [
     {
       name: 'backend',
-      cwd: path.join(__dirname, 'backend'),
+      cwd: path.join(root, 'backend'),
       script: 'src/index.js',
       instances: 2,              // cluster mode -> zero-downtime reloads
       exec_mode: 'cluster',
@@ -26,7 +29,7 @@ module.exports = {
       name: 'frontend',
       script: 'serve',
       env: {
-        PM2_SERVE_PATH: path.join(__dirname, 'frontend', 'dist'),
+        PM2_SERVE_PATH: path.join(root, 'frontend', 'dist'),
         PM2_SERVE_PORT: 8080,
         PM2_SERVE_SPA: 'true',
         PM2_SERVE_HOMEPAGE: '/index.html',

@@ -10,6 +10,41 @@ RELEASE_DIR="$APP_ROOT/releases/$BUILD"
 ARCHIVE="/tmp/release-$BUILD.tar.gz"
 ENV_FILE="$APP_ROOT/.env"
 
+# The ecosystem file uses this path, so PM2 follows the "current" link to each new release
+export APP_DIR="$APP_ROOT/current"
+
+# True when every running backend process works inside the release that "current" points to.
+backend_on_current_release() {
+  local want pid dir seen=0
+  want="$(readlink -f "$APP_ROOT/current/backend")"
+  for pid in $(pm2 pid backend 2>/dev/null); do
+    case "$pid" in ''|*[!0-9]*|0) continue ;; esac
+    dir="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    seen=1
+    [ "$dir" = "$want" ] || return 1
+  done
+  [ "$seen" -eq 1 ]
+}
+
+# Starts or reloads the apps and makes sure they really run the release "current" points to.
+start_apps() {
+  cd "$APP_ROOT/current"
+  pm2 startOrReload ecosystem.config.js --update-env
+  if ! backend_on_current_release; then
+    echo "==> PM2 is still using an older release folder, restarting the apps cleanly"
+    pm2 delete backend frontend >/dev/null 2>&1 || true
+    pm2 start ecosystem.config.js --update-env
+  fi
+  pm2 save
+}
+
+# The API must answer AND report that the database is reachable.
+healthy() {
+  local out
+  out="$(curl -fsS http://127.0.0.1:3000/api/health 2>/dev/null || true)"
+  grep -q '"db":"up"' <<< "$out"
+}
+
 echo "==> Checking database settings"
 if [ ! -f "$ENV_FILE" ]; then
   echo "!! $ENV_FILE not found. Run 'sudo bash scripts/setup-database.sh' on this server first."
@@ -33,15 +68,13 @@ PREV="$(readlink -f "$APP_ROOT/current" || true)"
 ln -sfn "$RELEASE_DIR" "$APP_ROOT/current"
 
 echo "==> Reloading PM2 apps"
-cd "$APP_ROOT/current"
 export APP_VERSION="$VERSION" BUILD_NUMBER="$BUILD"
-pm2 startOrReload ecosystem.config.js --update-env
-pm2 save
+start_apps
 
 echo "==> Health check (API and database)"
 ok=0
-for i in $(seq 1 15); do
-  if curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then ok=1; break; fi
+for _ in $(seq 1 15); do
+  if healthy; then ok=1; break; fi
   sleep 2
 done
 
@@ -50,7 +83,7 @@ if [ "$ok" -ne 1 ]; then
   pm2 logs backend --lines 25 --nostream || true
   if [ -n "$PREV" ] && [ -d "$PREV" ]; then
     ln -sfn "$PREV" "$APP_ROOT/current"
-    cd "$APP_ROOT/current" && pm2 startOrReload ecosystem.config.js --update-env
+    start_apps || true
   fi
   exit 1
 fi
@@ -59,4 +92,4 @@ echo "==> Cleaning up (keep last 5 releases)"
 rm -f "$ARCHIVE"
 cd "$APP_ROOT/releases" && ls -1dt */ | tail -n +6 | xargs -r rm -rf
 
-echo "==> Deploy of build $BUILD complete"
+echo "==> Deploy of build $BUILD complete (running from $(readlink -f "$APP_ROOT/current"))"
