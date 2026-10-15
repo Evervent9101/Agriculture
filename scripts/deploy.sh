@@ -50,7 +50,13 @@ if [ ! -f "$ENV_FILE" ]; then
   echo "!! $ENV_FILE not found. Run 'sudo bash scripts/setup-database.sh' on this server first."
   exit 1
 fi
-# Load DATABASE_URL (and anything else in the file) for PM2
+# The login system needs a secret to sign tokens. Create it once; it stays the same for every deploy,
+# so people stay logged in. Never printed, never in GitHub.
+if ! grep -q '^AUTH_SECRET=' "$ENV_FILE"; then
+  echo "==> Creating AUTH_SECRET for the login system (first time only)"
+  printf 'AUTH_SECRET=%s\n' "$(openssl rand -hex 32)" >> "$ENV_FILE"
+fi
+# Load DATABASE_URL, AUTH_SECRET (and anything else in the file) for PM2
 set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"

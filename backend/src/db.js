@@ -28,6 +28,16 @@ function createPool() {
   return new Pool({ connectionString: url, max: 10 });
 }
 
+// Databases created before logins existed have no crops.user_id yet. New ones already do.
+async function addUserColumn(client) {
+  try {
+    await client.query('SELECT user_id FROM crops LIMIT 0');
+  } catch (_) {
+    await client.query('ALTER TABLE crops ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE');
+  }
+  await client.query('CREATE INDEX IF NOT EXISTS idx_crops_user ON crops(user_id)');
+}
+
 // Creates the tables if they do not exist yet. Safe to run on every start.
 // An advisory lock makes the two PM2 instances take turns instead of racing.
 async function migrate(pool, { lock = true } = {}) {
@@ -43,6 +53,8 @@ async function migrate(pool, { lock = true } = {}) {
     for (const statement of statements) {
       await client.query(statement);
     }
+
+    await addUserColumn(client);
 
     const { rows } = await client.query('SELECT COUNT(*) AS n FROM activity_types');
     if (Number(rows[0].n) === 0) {

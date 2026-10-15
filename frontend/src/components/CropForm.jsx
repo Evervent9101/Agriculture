@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { api } from '../api.js';
 
 const SEASONS = ['Kharif', 'Rabi', 'Zaid', 'Perennial'];
 
@@ -16,6 +17,11 @@ export default function CropForm({ initial = {}, submitLabel, onSubmit, onCancel
     notes: initial.notes || '',
   });
   const [error, setError] = useState('');
+  const [guides, setGuides] = useState([]);
+
+  useEffect(() => {
+    api('/guide').then(setGuides).catch(() => {});
+  }, []);
   const [busy, setBusy] = useState(false);
 
   const set = (key) => (e) => setF({ ...f, [key]: e.target.value });
@@ -36,7 +42,11 @@ export default function CropForm({ initial = {}, submitLabel, onSubmit, onCancel
     <form className="form" onSubmit={submit}>
       <label>
         Crop name *
-        <input value={f.name} onChange={set('name')} placeholder="e.g. Wheat" required />
+        <input list="crop-names" value={f.name} onChange={set('name')} placeholder="e.g. Wheat" required />
+        <datalist id="crop-names">
+          {guides.map((g) => <option key={g.slug} value={g.name.replace(/ \(.*\)$/, '')} />)}
+        </datalist>
+        <span className="muted">Pick a crop from the list to get a guide on seed, fertilizer and water.</span>
       </label>
       <div className="row2">
         <label>

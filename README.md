@@ -241,3 +241,31 @@ Besides the existing request metrics, the backend now exposes `farm_crops{status
 - Add a table (for example `workers`, `equipment`, `weather_log`) in `schema.sql`, then an API route in `app.js` and a section in `CropDetail.jsx`.
 - User login so several farmers can use one install.
 - Reminders for upcoming harvests, alerts in Grafana for failed deploys, a `postgres-exporter` container to monitor the database itself.
+
+---
+
+# Version 3: Login and crop guidance
+
+## Login
+
+- Every farmer has their own account. Crops, work, sales and the dashboard are private to the account that created them.
+- Passwords are stored as salted `scrypt` hashes, never as plain text. Login tokens are signed with `AUTH_SECRET` and last 7 days.
+- After 8 wrong passwords for the same username and address, login is blocked for 10 minutes.
+- `AUTH_SECRET` is created automatically by `deploy.sh` the first time it runs and saved in `/opt/devops-app/.env` (never in GitHub). Keep that file private. If you change or delete the secret, everyone is logged out once.
+- **The first account that registers takes over the crops that existed before logins were added.** After you deploy, register your own account first.
+- To close sign-up after everyone has an account, add `ALLOW_REGISTRATION=false` on its own line to `/opt/devops-app/.env` on the deployment server and run `sudo -u deploy pm2 reload backend --update-env`.
+- `/api/health` and `/metrics` stay open without a login, so the pipeline smoke test and Prometheus keep working.
+- This site is served over plain HTTP. On a trusted office or farm network that is fine for learning. Before using it over the internet, add HTTPS (see the hardening list at the top), because passwords and tokens would otherwise travel unencrypted.
+
+## Crop guide
+
+Open any crop and you get a **Crop guide**: seed, fertilizer (DAP, urea, potash), farmyard manure, water and expected harvest, worked out for the crop's area, plus a day-by-day plan with dates (irrigation, fertilizer top-dressing, weeding, pest watch, harvest). The dashboard shows **Jobs due this week** across all crops.
+
+- Built in for: wheat, rice, maize, cotton, soybean, chickpea, mustard, groundnut, potato, tomato, onion. Local names such as gehu, dhan, makka, chana, sarson, aloo, tamatar, pyaz also work.
+- The crop name decides which guide is used, and the sowing date decides the dates. For rice, tomato and onion, enter the **transplanting** date as the sowing date.
+- The numbers are typical per-acre figures for irrigated Indian farms. They are a starting point, not a prescription. A soil test and advice from the local KVK or agriculture officer should win over them.
+- All guide data lives in `backend/src/guide.js`. To add a crop or correct a number, edit that file (copy an existing block). The test `every built-in crop has sane, complete data` checks that fertilizer shares add up and every plan has sowing and harvest steps.
+
+## Upgrading from Version 2
+
+No new packages and no new setup script. Push the code. On the first deploy, `deploy.sh` adds `AUTH_SECRET` to `/opt/devops-app/.env`, the backend adds the `users` table and `crops.user_id` column by itself, and your existing crops stay in the database until the first account registers.

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { rupees, niceDate, today, STATUS_LABELS } from '../format.js';
 import CropForm from './CropForm.jsx';
+import Guidance from './Guidance.jsx';
 
 const NEW_TYPE = '__new__';
 const DETAIL_IDEAS = ['Soil type', 'Seed supplier', 'Seed rate', 'Water source', 'Insurance', 'Previous crop'];
@@ -375,6 +376,7 @@ export default function CropDetail({ id }) {
         </div>
       </div>
 
+      <Guidance crop={crop} />
       <Details crop={crop} reload={reload} />
       <Activities crop={crop} types={types} reload={reload} />
       <Sales crop={crop} reload={reload} />

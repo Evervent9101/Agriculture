@@ -146,3 +146,31 @@ ul.timeline li::before {
 }
 .tl-head { display: flex; justify-content: space-between; gap: 8px; }
 .tl-actions { display: flex; gap: 4px; margin-top: 2px; }
+
+/* ---------- login ---------- */
+.login-wrap { min-height: 80vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.login-card { width: 100%; max-width: 400px; }
+.login-title { text-align: center; margin: 4px 0 6px; }
+.login-card > .muted { text-align: center; margin-top: 0; }
+.login-switch { text-align: center; margin: 16px 0 0; }
+.who { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 600; }
+button.ghost.light { color: #fff; border-color: rgba(255, 255, 255, 0.7); background: transparent; min-height: 36px; padding: 6px 12px; }
+button.ghost.light:hover { background: rgba(255, 255, 255, 0.18); }
+
+/* ---------- crop guide ---------- */
+.notice { background: #fff8e1; border: 1px solid #f0dfa0; border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 15px; }
+.needs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.need { background: var(--green-soft); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+.need-label { color: var(--muted); font-size: 14px; font-weight: 600; }
+.need-value { font-size: 18px; font-weight: 700; }
+.need-sub { color: var(--muted); font-size: 13px; }
+.pill { display: inline-block; background: var(--green-soft); border-radius: 999px; padding: 6px 12px; margin: 0 6px 6px 0; font-weight: 600; }
+.timeline .day { display: block; color: var(--muted); font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.task.past { opacity: 0.6; }
+.task.today, .task.soon { background: #f3faf3; }
+.due { white-space: nowrap; font-weight: 700; font-size: 14px; padding: 4px 10px; border-radius: 999px; background: var(--green-soft); color: var(--green-dark); }
+.due.soon, .due.today { background: #fff1c9; color: #7a5200; }
+.due.past { background: #fdecea; color: var(--danger); }
+.amounts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 4px; }
+.amount { font-size: 15px; }
+.fine { font-size: 13px; margin-top: 14px; }

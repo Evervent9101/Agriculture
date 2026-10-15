@@ -6,18 +6,28 @@ const { newDb } = require('pg-mem');
 const { createApp } = require('../src/app');
 const { migrate } = require('../src/db');
 
+const SECRET = 'test-secret-test-secret-1234';
+
 let server;
 let base;
 let pool;
+let token; // login token of the main test user
 
 before(async () => {
   const mem = newDb();
   const { Pool } = mem.adapters.createPg();
   pool = new Pool();
   await migrate(pool, { lock: false });
-  server = createApp({ pool }).listen(0);
+  server = createApp({ pool, authSecret: SECRET }).listen(0);
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
+
+  const reg = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'ramesh', full_name: 'Ramesh Kumar', password: 'correct-horse-1' }),
+  });
+  token = (await reg.json()).token;
 });
 
 after(async () => {
@@ -25,10 +35,14 @@ after(async () => {
   await pool.end();
 });
 
-async function api(method, path, body) {
+// Sends requests as the main test user unless another token (or null for none) is given.
+async function api(method, path, body, withToken = token) {
   const res = await fetch(`${base}${path}`, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(withToken ? { Authorization: `Bearer ${withToken}` } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   const raw = await res.text();
@@ -226,4 +240,221 @@ test('metrics expose request timings and farm counters', async () => {
   assert.strictEqual(res.status, 200);
   assert.match(body, /http_request_duration_seconds/);
   assert.match(body, /farm_records_created_total/);
+});
+
+// ---------- login ----------
+
+test('API needs a login, but health and metrics stay open', async () => {
+  assert.strictEqual((await api('GET', '/api/crops', undefined, null)).status, 401);
+  assert.strictEqual((await api('GET', '/api/summary', undefined, 'garbage.token')).status, 401);
+  assert.strictEqual((await api('GET', '/api/health', undefined, null)).status, 200);
+  assert.strictEqual((await fetch(`${base}/metrics`)).status, 200);
+});
+
+test('register validates input and refuses duplicate usernames', async () => {
+  const post = (b) => api('POST', '/api/auth/register', b, null);
+  assert.strictEqual((await post({ username: 'ab', full_name: 'X', password: 'longenough1' })).status, 400);
+  assert.strictEqual((await post({ username: 'sita', full_name: '', password: 'longenough1' })).status, 400);
+  assert.strictEqual((await post({ username: 'sita', full_name: 'Sita', password: 'short' })).status, 400);
+  assert.strictEqual((await post({ username: 'RAMESH', full_name: 'Other', password: 'longenough1' })).status, 409);
+});
+
+test('login works, the password is not stored in plain text, wrong passwords fail', async () => {
+  const ok = await api('POST', '/api/auth/login', { username: ' Ramesh ', password: 'correct-horse-1' }, null);
+  assert.strictEqual(ok.status, 200);
+  assert.ok(ok.body.token);
+  assert.strictEqual(ok.body.user.full_name, 'Ramesh Kumar');
+  assert.strictEqual(ok.body.user.password_hash, undefined);
+
+  const me = await api('GET', '/api/auth/me', undefined, ok.body.token);
+  assert.strictEqual(me.body.user.username, 'ramesh');
+
+  const stored = await pool.query("SELECT password_hash FROM users WHERE username = 'ramesh'");
+  assert.ok(stored.rows[0].password_hash.startsWith('scrypt$'));
+  assert.ok(!stored.rows[0].password_hash.includes('correct-horse-1'));
+
+  assert.strictEqual((await api('POST', '/api/auth/login', { username: 'ramesh', password: 'wrong-password' }, null)).status, 401);
+  assert.strictEqual((await api('POST', '/api/auth/login', { username: 'nobody', password: 'whatever123' }, null)).status, 401);
+});
+
+test('too many wrong passwords are blocked for a while', async () => {
+  await api('POST', '/api/auth/register', { username: 'locked', full_name: 'Locked', password: 'right-password' }, null);
+  let last;
+  for (let i = 0; i < 9; i += 1) {
+    last = await api('POST', '/api/auth/login', { username: 'locked', password: `wrong-${i}` }, null);
+  }
+  assert.strictEqual(last.status, 429);
+  // even the right password is refused during the lock
+  assert.strictEqual((await api('POST', '/api/auth/login', { username: 'locked', password: 'right-password' }, null)).status, 429);
+});
+
+test('a token signed with another secret, or expired, is rejected', async () => {
+  const { createToken, readToken } = require('../src/auth');
+  const forged = createToken(1, 'a-different-secret-entirely');
+  assert.strictEqual((await api('GET', '/api/crops', undefined, forged)).status, 401);
+  const old = createToken(1, SECRET, Date.now() - 8 * 24 * 60 * 60 * 1000);
+  assert.strictEqual(readToken(old, SECRET), null);
+  assert.strictEqual((await api('GET', '/api/crops', undefined, old)).status, 401);
+});
+
+test('each farmer only sees and changes their own data', async () => {
+  const other = (await api('POST', '/api/auth/register', { username: 'sita', full_name: 'Sita Devi', password: 'another-pass-1' }, null)).body.token;
+
+  const mine = await newCrop({ name: 'Private wheat', area_acres: 2 });
+  const act = (await api('POST', `/api/crops/${mine.id}/activities`, { type: 'Sowing', activity_date: '2026-11-01', cost: 100 })).body;
+  const sale = (await api('POST', `/api/crops/${mine.id}/sales`, { sale_date: '2027-03-01', quantity: 5, price_per_unit: 10 })).body;
+  const detail = (await api('POST', `/api/crops/${mine.id}/details`, { label: 'Soil', value: 'Loam' })).body;
+
+  const theirs = (await api('GET', '/api/crops', undefined, other)).body;
+  assert.strictEqual(theirs.length, 0);
+  assert.strictEqual((await api('GET', `/api/crops/${mine.id}`, undefined, other)).status, 404);
+  assert.strictEqual((await api('PUT', `/api/crops/${mine.id}`, { name: 'Stolen' }, other)).status, 404);
+  assert.strictEqual((await api('DELETE', `/api/crops/${mine.id}`, undefined, other)).status, 404);
+  assert.strictEqual((await api('POST', `/api/crops/${mine.id}/activities`, { type: 'Sowing', activity_date: '2026-11-01' }, other)).status, 404);
+  assert.strictEqual((await api('PUT', `/api/activities/${act.id}`, { type: 'Sowing', activity_date: '2026-11-02' }, other)).status, 404);
+  assert.strictEqual((await api('DELETE', `/api/activities/${act.id}`, undefined, other)).status, 404);
+  assert.strictEqual((await api('DELETE', `/api/sales/${sale.id}`, undefined, other)).status, 404);
+  assert.strictEqual((await api('DELETE', `/api/details/${detail.id}`, undefined, other)).status, 404);
+  assert.strictEqual((await api('GET', `/api/crops/${mine.id}/guidance`, undefined, other)).status, 404);
+
+  const summary = (await api('GET', '/api/summary', undefined, other)).body;
+  assert.strictEqual(summary.crops.total, 0);
+  assert.strictEqual(summary.total_cost, 0);
+
+  // and everything is still intact for the owner
+  const still = (await api('GET', `/api/crops/${mine.id}`)).body;
+  assert.strictEqual(still.name, 'Private wheat');
+  assert.strictEqual(still.activities.length, 1);
+  assert.strictEqual(still.sales.length, 1);
+  assert.strictEqual(still.details.length, 1);
+});
+
+test('the first account takes over crops created before logins existed', async () => {
+  const mem = newDb();
+  const { Pool } = mem.adapters.createPg();
+  const p2 = new Pool();
+  await migrate(p2, { lock: false });
+  await p2.query("INSERT INTO crops (name, area_acres) VALUES ('Old wheat', 3)");
+  const srv = createApp({ pool: p2, authSecret: SECRET }).listen(0);
+  await new Promise((r) => srv.once('listening', r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const post = (path, body, t) =>
+    fetch(`${url}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(t ? { Authorization: `Bearer ${t}` } : {}) },
+      body: JSON.stringify(body),
+    }).then((r) => r.json());
+  try {
+    const first = await post('/api/auth/register', { username: 'owner', full_name: 'Owner', password: 'long-password-1' });
+    const list = await fetch(`${url}/api/crops`, { headers: { Authorization: `Bearer ${first.token}` } }).then((r) => r.json());
+    assert.deepStrictEqual(list.map((c) => c.name), ['Old wheat']);
+
+    const second = await post('/api/auth/register', { username: 'newcomer', full_name: 'New', password: 'long-password-2' });
+    const none = await fetch(`${url}/api/crops`, { headers: { Authorization: `Bearer ${second.token}` } }).then((r) => r.json());
+    assert.strictEqual(none.length, 0);
+  } finally {
+    srv.close();
+    await p2.end();
+  }
+});
+
+test('registration can be switched off', async () => {
+  const mem = newDb();
+  const { Pool } = mem.adapters.createPg();
+  const p3 = new Pool();
+  await migrate(p3, { lock: false });
+  const srv = createApp({ pool: p3, authSecret: SECRET, allowRegistration: false }).listen(0);
+  await new Promise((r) => srv.once('listening', r));
+  try {
+    const res = await fetch(`http://127.0.0.1:${srv.address().port}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'someone', full_name: 'Someone', password: 'long-password-1' }),
+    });
+    assert.strictEqual(res.status, 403);
+  } finally {
+    srv.close();
+    await p3.end();
+  }
+});
+
+test('the app refuses to start without a proper secret', () => {
+  assert.throws(() => createApp({ pool }), /AUTH_SECRET/);
+  assert.throws(() => createApp({ pool, authSecret: 'short' }), /AUTH_SECRET/);
+});
+
+// ---------- guidance ----------
+
+test('guidance scales seed, fertilizer, water and yield to the crop area', async () => {
+  const crop = await newCrop({ name: 'Wheat (HD-2967)', area_acres: 2.5, sowing_date: '2026-11-10' });
+  const res = await api('GET', `/api/crops/${crop.id}/guidance`);
+  assert.strictEqual(res.status, 200);
+  const g = res.body;
+  assert.strictEqual(g.matched, true);
+  assert.strictEqual(g.slug, 'wheat');
+  assert.deepStrictEqual(g.total.seed, { min: 100, max: 125, unit: 'kg' });
+  assert.deepStrictEqual(g.total.nutrients, { n: 120, p: 60, k: 40 });
+  const dap = g.total.products.find((p) => p.name === 'DAP');
+  const urea = g.total.products.find((p) => p.name === 'Urea');
+  assert.strictEqual(dap.kg, 130.4);
+  assert.strictEqual(urea.kg, 209.8);
+
+  // the dated plan: sowing day is day 0, the first irrigation is 21 days later
+  const first = g.tasks.find((t) => t.type === 'irrigation');
+  assert.strictEqual(first.date, '2026-12-01');
+  assert.strictEqual(first.water_litres, 506000);
+  const sorted = [...g.tasks].sort((a, b) => a.das - b.das).map((t) => t.das);
+  assert.deepStrictEqual(g.tasks.map((t) => t.das), sorted);
+
+  // the urea in the top-dress steps adds up to the total
+  const urea2 = g.tasks.filter((t) => t.type === 'fertilizer').flatMap((t) => t.products).filter((p) => p.name === 'Urea');
+  assert.ok(Math.abs(urea2.reduce((s, p) => s + p.kg, 0) - urea.kg) < 0.2);
+});
+
+test('guidance works without area or sowing date, and knows local crop names', async () => {
+  const crop = await newCrop({ name: 'Gehu' });
+  const g = (await api('GET', `/api/crops/${crop.id}/guidance`)).body;
+  assert.strictEqual(g.matched, true);
+  assert.strictEqual(g.per_acre_only, true);
+  assert.strictEqual(g.tasks[0].date, null);
+  assert.deepStrictEqual(g.total.seed, { min: 40, max: 50, unit: 'kg' });
+});
+
+test('guidance for an unknown crop lists the crops it does know', async () => {
+  const crop = await newCrop({ name: 'Dragon fruit' });
+  const g = (await api('GET', `/api/crops/${crop.id}/guidance`)).body;
+  assert.strictEqual(g.matched, false);
+  assert.ok(g.available.length >= 10);
+  assert.strictEqual((await api('GET', '/api/crops/99999/guidance')).status, 404);
+});
+
+test('every built-in crop has sane, complete data', () => {
+  const { GUIDE, buildGuidance } = require('../src/guide');
+  const slugs = new Set();
+  for (const g of GUIDE) {
+    assert.ok(!slugs.has(g.slug), `duplicate ${g.slug}`);
+    slugs.add(g.slug);
+    assert.ok(g.seed.min > 0 && g.seed.max >= g.seed.min, `${g.slug} seed`);
+    assert.ok(g.water_mm[1] >= g.water_mm[0] && g.yield_quintal[1] >= g.yield_quintal[0], `${g.slug} ranges`);
+    assert.ok(g.schedule.some((t) => t.type === 'harvest'), `${g.slug} has no harvest step`);
+    assert.ok(g.schedule.some((t) => t.type === 'sowing' && t.das <= 0), `${g.slug} has no sowing step`);
+
+    // fertilizer shares never add up to more than 100 percent of each nutrient
+    for (const nutrient of ['n', 'p', 'k']) {
+      const sum = g.schedule.filter((t) => t.type === 'fertilizer').reduce((s, t) => s + (t.share[nutrient] || 0), 0);
+      assert.ok(sum <= 1.0001, `${g.slug} ${nutrient} shares add up to ${sum}`);
+      assert.ok(sum >= 0.99 || g.nutrients[nutrient] === 0, `${g.slug} ${nutrient} is never fully applied (${sum})`);
+    }
+    const built = buildGuidance(g, { area_acres: 1, sowing_date: '2026-06-01' }, '2026-06-01');
+    assert.ok(built.tasks.every((t) => /^\d{4}-\d{2}-\d{2}$/.test(t.date)));
+  }
+});
+
+test('the dashboard lists tasks due soon for crops with a sowing date', async () => {
+  const today = new Date();
+  const sown = new Date(today.getTime() - 20 * 86400000).toISOString().slice(0, 10); // 20 days ago
+  const crop = await newCrop({ name: 'Wheat for reminders', area_acres: 1, sowing_date: sown, status: 'growing' });
+  const summary = (await api('GET', '/api/summary')).body;
+  const due = summary.due_tasks.filter((t) => t.crop_id === crop.id);
+  assert.ok(due.some((t) => t.type === 'irrigation' && t.days_from_today === 1), 'first irrigation is due tomorrow');
 });

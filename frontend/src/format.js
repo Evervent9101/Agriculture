@@ -29,3 +29,27 @@ export const STATUS_LABELS = {
   growing: 'Growing',
   harvested: 'Harvested',
 };
+
+// Water in the units Indian farmers use: lakh (1,00,000) and crore (1,00,00,000) litres
+export function litres(value) {
+  const v = Number(value) || 0;
+  if (v >= 1e7) return `${(v / 1e7).toFixed(2)} crore litres`;
+  if (v >= 1e5) return `${(v / 1e5).toFixed(1)} lakh litres`;
+  return `${Math.round(v).toLocaleString('en-IN')} litres`;
+}
+
+export const kg = (value) => `${Number(value).toLocaleString('en-IN', { maximumFractionDigits: 1 })} kg`;
+
+// "40 to 50 kg" or just "1 kg" when both ends are the same
+export function range(min, max, unit) {
+  const f = (x) => Number(x).toLocaleString('en-IN', { maximumFractionDigits: 1 });
+  return min === max ? `${f(min)} ${unit}` : `${f(min)} to ${f(max)} ${unit}`;
+}
+
+export function whenText(days) {
+  if (days === 0) return 'today';
+  if (days === 1) return 'tomorrow';
+  if (days > 1) return `in ${days} days`;
+  if (days === -1) return 'yesterday';
+  return `${-days} days ago`;
+}

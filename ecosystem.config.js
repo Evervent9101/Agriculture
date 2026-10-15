@@ -20,6 +20,8 @@ module.exports = {
         NODE_ENV: 'production',
         PORT: 3000,
         DATABASE_URL: process.env.DATABASE_URL,
+        AUTH_SECRET: process.env.AUTH_SECRET,                       // signs login tokens (created by deploy.sh)
+        ALLOW_REGISTRATION: process.env.ALLOW_REGISTRATION || 'true', // set to false in .env to close sign-up
         APP_VERSION: process.env.APP_VERSION || '2.0.0',
         BUILD_NUMBER: process.env.BUILD_NUMBER || 'manual',
       },

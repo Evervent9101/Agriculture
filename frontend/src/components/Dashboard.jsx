@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
-import { rupees, niceDate } from '../format.js';
+import { rupees, niceDate, kg, litres, whenText } from '../format.js';
 
 export default function Dashboard() {
   const [s, setS] = useState(null);
@@ -43,6 +43,31 @@ export default function Dashboard() {
           <span className="tile-value">{rupees(Math.abs(s.profit))}</span>
         </div>
       </div>
+
+      <section className="card">
+        <h2>Jobs due this week</h2>
+        {s.due_tasks.length === 0 && (
+          <p className="muted">
+            Nothing due. Add a sowing date to a crop (with a crop name like Wheat or Rice) and its jobs will show here.
+          </p>
+        )}
+        <ul className="plain">
+          {s.due_tasks.map((t, i) => (
+            <li key={i} className={`task ${t.days_from_today < 0 ? 'past' : t.days_from_today <= 1 ? 'soon' : ''}`}>
+              <div>
+                <strong>{t.title}</strong> · <a href={`#/crops/${t.crop_id}`}>{t.crop_name}</a>
+                {t.products && t.products.length > 0 && (
+                  <div className="amounts">
+                    {t.products.map((p) => <span key={p.name} className="amount">{p.name}: <strong>{kg(p.kg)}</strong></span>)}
+                  </div>
+                )}
+                {t.water_litres ? <div className="amounts"><span className="amount">Water: <strong>about {litres(t.water_litres)}</strong></span></div> : null}
+              </div>
+              <span className={`due ${t.days_from_today < 0 ? 'past' : t.days_from_today <= 1 ? 'soon' : ''}`}>{whenText(t.days_from_today)}</span>
+            </li>
+          ))}
+        </ul>
+      </section>
 
       <div className="grid2">
         <section className="card">

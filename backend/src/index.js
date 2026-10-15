@@ -7,7 +7,11 @@ async function main() {
   const pool = createPool();
   await migrate(pool);
 
-  const app = createApp({ pool });
+  const app = createApp({
+    pool,
+    authSecret: process.env.AUTH_SECRET,
+    allowRegistration: process.env.ALLOW_REGISTRATION !== 'false',
+  });
   const server = app.listen(PORT, () => {
     console.log(`farm backend listening on :${PORT}`);
   });

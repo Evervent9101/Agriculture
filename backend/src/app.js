@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const client = require('prom-client');
+const { hashPassword, verifyPassword, createToken, readToken, createLoginLimiter } = require('./auth');
+const { findGuide, buildGuidance, listGuides } = require('./guide');
 
 const CROP_STATUSES = ['planned', 'growing', 'harvested'];
 
@@ -163,12 +165,42 @@ function readSale(body) {
   };
 }
 
+// Tasks from every crop's guidance that are due in the next 7 days (or were due in the last 3).
+function dueTasks(crops, today) {
+  const out = [];
+  for (const crop of crops) {
+    if (crop.status === 'harvested' || !crop.sowing_date) continue;
+    const guide = findGuide(crop.name);
+    if (!guide) continue;
+    const g = buildGuidance(guide, crop, today);
+    for (const t of g.tasks) {
+      if (t.days_from_today >= -3 && t.days_from_today <= 7 && t.type !== 'sowing' && t.type !== 'prep') {
+        out.push({
+          crop_id: crop.id,
+          crop_name: crop.name,
+          title: t.title,
+          type: t.type,
+          date: t.date,
+          days_from_today: t.days_from_today,
+          products: t.products || null,
+          water_litres: t.water_litres || null,
+        });
+      }
+    }
+  }
+  return out.sort((a, b) => a.days_from_today - b.days_from_today).slice(0, 12);
+}
+
 // ---------- the app ----------
 
-function createApp({ pool }) {
+function createApp({ pool, authSecret, allowRegistration = true }) {
+  if (!authSecret || String(authSecret).length < 16) {
+    throw new Error('AUTH_SECRET must be set (at least 16 characters). deploy.sh creates it in /opt/devops-app/.env');
+  }
   const app = express();
+  app.set('trust proxy', 'loopback'); // Nginx runs on the same machine
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '100kb' }));
 
   // ----- Prometheus metrics -----
   const register = new client.Registry();
@@ -241,15 +273,117 @@ function createApp({ pool }) {
     });
   });
 
+  // ----- login -----
+  const limiter = createLoginLimiter();
+
+  const readUsername = (v) => {
+    const name = String(v || '').trim().toLowerCase();
+    return /^[a-z0-9._@+-]{3,60}$/.test(name) ? name : null;
+  };
+
+  const publicUser = (u) => ({ id: u.id, username: u.username, full_name: u.full_name });
+
+  app.get('/api/auth/config', (req, res) => res.json({ registration: Boolean(allowRegistration) }));
+
+  app.post(
+    '/api/auth/register',
+    wrap(async (req, res) => {
+      if (!allowRegistration) return res.status(403).json({ error: 'New accounts are switched off on this server' });
+      const b = req.body || {};
+      const username = readUsername(b.username);
+      if (!username) return bad(res, 'Username needs 3 to 60 letters, numbers or . _ @ + -');
+      const fullName = text(b.full_name, 100);
+      if (!fullName) return bad(res, 'Your name is required');
+      const password = typeof b.password === 'string' ? b.password : '';
+      if (password.length < 8) return bad(res, 'Password must be at least 8 characters');
+      if (password.length > 200) return bad(res, 'Password is too long');
+
+      const taken = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+      if (taken.rows.length > 0) return res.status(409).json({ error: 'That username is already taken' });
+
+      const hash = await hashPassword(password);
+      let user;
+      try {
+        user = (
+          await pool.query('INSERT INTO users (username, full_name, password_hash) VALUES ($1, $2, $3) RETURNING *', [
+            username,
+            fullName,
+            hash,
+          ])
+        ).rows[0];
+      } catch (_) {
+        return res.status(409).json({ error: 'That username is already taken' });
+      }
+
+      // The very first account takes over any crops created before logins existed.
+      const count = await pool.query('SELECT COUNT(*) AS n FROM users');
+      if (Number(count.rows[0].n) === 1) {
+        await pool.query('UPDATE crops SET user_id = $1 WHERE user_id IS NULL', [user.id]);
+      }
+
+      recordsCreated.inc({ kind: 'user' });
+      res.status(201).json({ token: createToken(user.id, authSecret), user: publicUser(user) });
+    })
+  );
+
+  app.post(
+    '/api/auth/login',
+    wrap(async (req, res) => {
+      const b = req.body || {};
+      const username = readUsername(b.username);
+      const password = typeof b.password === 'string' ? b.password : '';
+      const key = `${req.ip}|${username || ''}`;
+      if (limiter.blocked(key)) {
+        return res.status(429).json({ error: 'Too many wrong attempts. Please wait 10 minutes and try again.' });
+      }
+      const user = username ? (await pool.query('SELECT * FROM users WHERE username = $1', [username])).rows[0] : null;
+      const ok = user ? await verifyPassword(password, user.password_hash) : (await hashPassword('x'), false);
+      if (!ok) {
+        limiter.fail(key);
+        return res.status(401).json({ error: 'Wrong username or password' });
+      }
+      limiter.reset(key);
+      res.json({ token: createToken(user.id, authSecret), user: publicUser(user) });
+    })
+  );
+
+  // Everything below this line needs a valid login token.
+  app.use('/api', (req, res, next) => {
+    const header = req.get('authorization') || '';
+    const userId = header.startsWith('Bearer ') ? readToken(header.slice(7), authSecret) : null;
+    if (!userId) return res.status(401).json({ error: 'Please log in' });
+    req.userId = userId;
+    next();
+  });
+
+  app.get(
+    '/api/auth/me',
+    wrap(async (req, res) => {
+      const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+      if (rows.length === 0) return res.status(401).json({ error: 'Please log in again' });
+      res.json({ user: publicUser(rows[0]) });
+    })
+  );
+
   // ----- crops -----
   app.get(
     '/api/crops',
     wrap(async (req, res) => {
-      const crops = (await pool.query('SELECT * FROM crops ORDER BY id DESC')).rows;
-      const costs = (await pool.query('SELECT crop_id, SUM(cost) AS total, COUNT(*) AS cnt FROM activities GROUP BY crop_id')).rows;
-      const sales = (await pool.query('SELECT * FROM sales')).rows;
+      const crops = (await pool.query('SELECT * FROM crops WHERE user_id = $1 ORDER BY id DESC', [req.userId])).rows;
+      const acts = (
+        await pool.query('SELECT a.* FROM activities a JOIN crops c ON c.id = a.crop_id WHERE c.user_id = $1', [req.userId])
+      ).rows.map(mapActivity);
+      const sales = (
+        await pool.query('SELECT s.* FROM sales s JOIN crops c ON c.id = s.crop_id WHERE c.user_id = $1', [req.userId])
+      ).rows;
 
-      const costBy = new Map(costs.map((r) => [r.crop_id, { total: Number(r.total), count: Number(r.cnt) }]));
+      const costBy = new Map();
+      for (const a of acts) {
+        const c = costBy.get(a.crop_id) || { total: 0, count: 0 };
+        c.total += a.cost;
+        c.count += 1;
+        costBy.set(a.crop_id, c);
+      }
       const incomeBy = new Map();
       for (const s of sales.map(mapSale)) {
         incomeBy.set(s.crop_id, (incomeBy.get(s.crop_id) || 0) + s.amount);
@@ -277,9 +411,9 @@ function createApp({ pool }) {
       const { error, value: v } = readCrop(req.body);
       if (error) return bad(res, error);
       const { rows } = await pool.query(
-        `INSERT INTO crops (name, variety, field_name, area_acres, season, sowing_date, expected_harvest_date, status, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [v.name, v.variety, v.field_name, v.area_acres, v.season, v.sowing_date, v.expected_harvest_date, v.status, v.notes]
+        `INSERT INTO crops (name, variety, field_name, area_acres, season, sowing_date, expected_harvest_date, status, notes, user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+        [v.name, v.variety, v.field_name, v.area_acres, v.season, v.sowing_date, v.expected_harvest_date, v.status, v.notes, req.userId]
       );
       recordsCreated.inc({ kind: 'crop' });
       res.status(201).json({ ...mapCrop(rows[0]), activity_count: 0, total_cost: 0, total_income: 0, profit: 0 });
@@ -291,7 +425,7 @@ function createApp({ pool }) {
     wrap(async (req, res) => {
       const id = idOf(req.params.id);
       if (!id) return notFound(res, 'Crop not found');
-      const found = await pool.query('SELECT * FROM crops WHERE id = $1', [id]);
+      const found = await pool.query('SELECT * FROM crops WHERE id = $1 AND user_id = $2', [id, req.userId]);
       if (found.rows.length === 0) return notFound(res, 'Crop not found');
 
       const details = (await pool.query('SELECT id, label, value FROM crop_details WHERE crop_id = $1 ORDER BY id', [id])).rows;
@@ -329,8 +463,8 @@ function createApp({ pool }) {
       const { rows } = await pool.query(
         `UPDATE crops SET name = $1, variety = $2, field_name = $3, area_acres = $4, season = $5,
            sowing_date = $6, expected_harvest_date = $7, status = $8, notes = $9
-         WHERE id = $10 RETURNING *`,
-        [v.name, v.variety, v.field_name, v.area_acres, v.season, v.sowing_date, v.expected_harvest_date, v.status, v.notes, id]
+         WHERE id = $10 AND user_id = $11 RETURNING *`,
+        [v.name, v.variety, v.field_name, v.area_acres, v.season, v.sowing_date, v.expected_harvest_date, v.status, v.notes, id, req.userId]
       );
       if (rows.length === 0) return notFound(res, 'Crop not found');
       res.json(mapCrop(rows[0]));
@@ -342,7 +476,7 @@ function createApp({ pool }) {
     wrap(async (req, res) => {
       const id = idOf(req.params.id);
       if (!id) return notFound(res, 'Crop not found');
-      const result = await pool.query('DELETE FROM crops WHERE id = $1 RETURNING id', [id]);
+      const result = await pool.query('DELETE FROM crops WHERE id = $1 AND user_id = $2 RETURNING id', [id, req.userId]);
       if (result.rows.length === 0) return notFound(res, 'Crop not found');
       res.status(204).end();
     })
@@ -357,7 +491,7 @@ function createApp({ pool }) {
       const label = text(req.body && req.body.label, 60);
       const value = text(req.body && req.body.value, 500);
       if (!label || !value) return bad(res, 'Both a label and a value are required');
-      const crop = await pool.query('SELECT id FROM crops WHERE id = $1', [id]);
+      const crop = await pool.query('SELECT id FROM crops WHERE id = $1 AND user_id = $2', [id, req.userId]);
       if (crop.rows.length === 0) return notFound(res, 'Crop not found');
       const { rows } = await pool.query(
         'INSERT INTO crop_details (crop_id, label, value) VALUES ($1, $2, $3) RETURNING id, label, value',
@@ -372,11 +506,20 @@ function createApp({ pool }) {
     wrap(async (req, res) => {
       const id = idOf(req.params.id);
       if (!id) return notFound(res);
-      const result = await pool.query('DELETE FROM crop_details WHERE id = $1 RETURNING id', [id]);
-      if (result.rows.length === 0) return notFound(res);
+      if (!(await ownedChild('crop_details', id, req.userId))) return notFound(res);
+      await pool.query('DELETE FROM crop_details WHERE id = $1', [id]);
       res.status(204).end();
     })
   );
+
+  // Finds the crop id of a child row (activity, sale or detail) ONLY if the crop belongs to this user.
+  async function ownedChild(table, id, userId) {
+    const { rows } = await pool.query(
+      `SELECT t.id FROM ${table} t JOIN crops c ON c.id = t.crop_id WHERE t.id = $1 AND c.user_id = $2`,
+      [id, userId]
+    );
+    return rows.length > 0;
+  }
 
   // ----- activity types (the list farmers pick from; new ones are added automatically) -----
   app.get(
@@ -406,7 +549,7 @@ function createApp({ pool }) {
       if (!id) return notFound(res, 'Crop not found');
       const { error, value: v } = readActivity(req.body);
       if (error) return bad(res, error);
-      const crop = await pool.query('SELECT id FROM crops WHERE id = $1', [id]);
+      const crop = await pool.query('SELECT id FROM crops WHERE id = $1 AND user_id = $2', [id, req.userId]);
       if (crop.rows.length === 0) return notFound(res, 'Crop not found');
 
       await ensureActivityType(v.type);
@@ -427,13 +570,13 @@ function createApp({ pool }) {
       if (!id) return notFound(res, 'Activity not found');
       const { error, value: v } = readActivity(req.body);
       if (error) return bad(res, error);
+      if (!(await ownedChild('activities', id, req.userId))) return notFound(res, 'Activity not found');
       await ensureActivityType(v.type);
       const { rows } = await pool.query(
         `UPDATE activities SET type = $1, activity_date = $2, description = $3, quantity = $4, unit = $5, cost = $6
          WHERE id = $7 RETURNING *`,
         [v.type, v.activity_date, v.description, v.quantity, v.unit, v.cost, id]
       );
-      if (rows.length === 0) return notFound(res, 'Activity not found');
       res.json(mapActivity(rows[0]));
     })
   );
@@ -443,8 +586,8 @@ function createApp({ pool }) {
     wrap(async (req, res) => {
       const id = idOf(req.params.id);
       if (!id) return notFound(res, 'Activity not found');
-      const result = await pool.query('DELETE FROM activities WHERE id = $1 RETURNING id', [id]);
-      if (result.rows.length === 0) return notFound(res, 'Activity not found');
+      if (!(await ownedChild('activities', id, req.userId))) return notFound(res, 'Activity not found');
+      await pool.query('DELETE FROM activities WHERE id = $1', [id]);
       res.status(204).end();
     })
   );
@@ -457,7 +600,7 @@ function createApp({ pool }) {
       if (!id) return notFound(res, 'Crop not found');
       const { error, value: v } = readSale(req.body);
       if (error) return bad(res, error);
-      const crop = await pool.query('SELECT id FROM crops WHERE id = $1', [id]);
+      const crop = await pool.query('SELECT id FROM crops WHERE id = $1 AND user_id = $2', [id, req.userId]);
       if (crop.rows.length === 0) return notFound(res, 'Crop not found');
       const { rows } = await pool.query(
         `INSERT INTO sales (crop_id, sale_date, quantity, unit, price_per_unit, buyer)
@@ -474,8 +617,8 @@ function createApp({ pool }) {
     wrap(async (req, res) => {
       const id = idOf(req.params.id);
       if (!id) return notFound(res, 'Sale not found');
-      const result = await pool.query('DELETE FROM sales WHERE id = $1 RETURNING id', [id]);
-      if (result.rows.length === 0) return notFound(res, 'Sale not found');
+      if (!(await ownedChild('sales', id, req.userId))) return notFound(res, 'Sale not found');
+      await pool.query('DELETE FROM sales WHERE id = $1', [id]);
       res.status(204).end();
     })
   );
@@ -484,16 +627,30 @@ function createApp({ pool }) {
   app.get(
     '/api/summary',
     wrap(async (req, res) => {
-      const crops = (await pool.query('SELECT * FROM crops')).rows.map(mapCrop);
-      const byType = (
-        await pool.query('SELECT type, SUM(cost) AS total, COUNT(*) AS cnt FROM activities GROUP BY type ORDER BY type')
-      ).rows.map((r) => ({ type: r.type, total: round2(Number(r.total)), count: Number(r.cnt) }));
-      const sales = (await pool.query('SELECT * FROM sales')).rows.map(mapSale);
+      const crops = (await pool.query('SELECT * FROM crops WHERE user_id = $1', [req.userId])).rows.map(mapCrop);
+      const allActs = (
+        await pool.query('SELECT a.* FROM activities a JOIN crops c ON c.id = a.crop_id WHERE c.user_id = $1', [req.userId])
+      ).rows.map(mapActivity);
+      const typeTotals = new Map();
+      for (const a of allActs) {
+        const t = typeTotals.get(a.type) || { type: a.type, total: 0, count: 0 };
+        t.total += a.cost;
+        t.count += 1;
+        typeTotals.set(a.type, t);
+      }
+      const byType = [...typeTotals.values()]
+        .sort((x, y) => x.type.localeCompare(y.type))
+        .map((t) => ({ type: t.type, total: round2(t.total), count: t.count }));
+      const sales = (
+        await pool.query('SELECT s.* FROM sales s JOIN crops c ON c.id = s.crop_id WHERE c.user_id = $1', [req.userId])
+      ).rows.map(mapSale);
       const recent = (
         await pool.query(
           `SELECT a.*, c.name AS crop_name FROM activities a
            JOIN crops c ON c.id = a.crop_id
-           ORDER BY a.activity_date DESC, a.id DESC LIMIT 5`
+           WHERE c.user_id = $1
+           ORDER BY a.activity_date DESC, a.id DESC LIMIT 5`,
+          [req.userId]
         )
       ).rows.map((r) => ({ ...mapActivity(r), crop_name: r.crop_name }));
 
@@ -521,7 +678,25 @@ function createApp({ pool }) {
         cost_by_type: byType,
         upcoming_harvests: upcoming,
         recent_activities: recent,
+        due_tasks: dueTasks(crops, today),
       });
+    })
+  );
+
+  // ----- guidance: how much seed, fertilizer and water, and when -----
+  app.get('/api/guide', (req, res) => res.json(listGuides()));
+
+  app.get(
+    '/api/crops/:id/guidance',
+    wrap(async (req, res) => {
+      const id = idOf(req.params.id);
+      if (!id) return notFound(res, 'Crop not found');
+      const { rows } = await pool.query('SELECT * FROM crops WHERE id = $1 AND user_id = $2', [id, req.userId]);
+      if (rows.length === 0) return notFound(res, 'Crop not found');
+      const crop = mapCrop(rows[0]);
+      const guide = findGuide(crop.name);
+      if (!guide) return res.json({ matched: false, crop_name: crop.name, available: listGuides() });
+      res.json(buildGuidance(guide, crop));
     })
   );
 
